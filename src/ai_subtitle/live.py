@@ -47,6 +47,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-ASR-1.7B"
 SILENT_SEGMENT_RMS = 0.003
 ROLLING_SEC = 60.0
 SPEAKER_MATCH_THRESHOLD = 0.875
+CONTEXT_TAIL_CHARS = 120
 
 
 def _list_avfoundation_devices() -> list[tuple[int, str]]:
@@ -155,6 +156,7 @@ class _SpeakerRegistry:
         match_threshold: float = SPEAKER_MATCH_THRESHOLD,
         confirm_threshold: float = 0.85,
         floor: float = 0.6,
+        max_speakers: Optional[int] = None,
     ) -> None:
         import senko
 
@@ -162,6 +164,7 @@ class _SpeakerRegistry:
         self._match = match_threshold
         self._confirm = confirm_threshold
         self._floor = floor
+        self._max = max_speakers
         self._speakers: list[list] = []  # [[label, centroid], ...]
         self._pending: Optional[np.ndarray] = None
 
@@ -186,6 +189,12 @@ class _SpeakerRegistry:
         if best_score >= self._match:
             assert best_ref is not None
             best_ref[1] = 0.7 * best_ref[1] + 0.3 * centroid  # track voice drift
+            return best_label
+
+        # With a known speaker count, never exceed it: drifted same-voice
+        # observations stay stickily attributed instead of spawning ghosts.
+        at_cap = self._max is not None and len(self._speakers) >= self._max
+        if at_cap:
             return best_label
 
         if self._pending is not None and float(self._similarity(centroid, self._pending)) >= self._confirm:
@@ -223,7 +232,9 @@ def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
             flush=True,
         )
-    registry = _SpeakerRegistry() if diarizer is not None else None
+    registry = (
+        _SpeakerRegistry(max_speakers=args.speakers) if diarizer is not None else None
+    )
 
     language = None if args.language == "auto" else args.language
     out_dir = Path(args.output_dir)
@@ -285,6 +296,8 @@ def _run(args: argparse.Namespace) -> int:
     segments = 0
     lines: list[str] = []
     detected_language = args.language if language else "auto"
+    use_context = not args.no_context
+    context_tail = ""  # tail of previous transcript, fed back as decode context
 
     def assign_speaker(start_sec: float, end_sec: float) -> str:
         if diarizer is None or registry is None or not recent:
@@ -296,6 +309,8 @@ def _run(args: argparse.Namespace) -> int:
         data = diarizer.diarize_samples(
             window, sample_rate=TARGET_RATE, source_name="live"
         )
+        if not data:  # no speech found in window (e.g. silence)
+            return ""
         centroids = data.get("speaker_centroids") or {}
         window_start = stream_sec - window_sec
         best_speaker = ""
@@ -312,12 +327,16 @@ def _run(args: argparse.Namespace) -> int:
         return registry.assign(np.asarray(centroid, dtype=np.float32))
 
     def transcribe_segment(samples: np.ndarray, start_sec: float, end_sec: float) -> None:
-        nonlocal decode_sec, detected_language, segments
+        nonlocal decode_sec, detected_language, segments, context_tail
         rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2) + 1e-12))
         if rms < SILENT_SEGMENT_RMS:
             return
         t1 = time.time()
-        result = session.transcribe((samples, TARGET_RATE), language=language)
+        result = session.transcribe(
+            (samples, TARGET_RATE),
+            language=language,
+            context=context_tail if use_context else "",
+        )
         decode_sec += time.time() - t1
         segments += 1
         text = str(result.text or "").strip()
@@ -325,6 +344,8 @@ def _run(args: argparse.Namespace) -> int:
             detected_language = result.language
         if not text:
             return
+        if use_context:
+            context_tail = (context_tail + text)[-CONTEXT_TAIL_CHARS:]
         speaker = assign_speaker(start_sec, end_sec)
         mm, ss = divmod(int(start_sec), 60)
         time_label = f"[{mm:02d}:{ss:02d}]"
@@ -429,6 +450,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--no-diarize", action="store_true",
         help="关闭实时分角色（默认开启，说话人标签与文字同延迟）",
+    )
+    parser.add_argument(
+        "--no-context", action="store_true",
+        help="关闭跨段文本上下文接力（默认开启：把前文尾部作为提示词传给下一段解码，改善专名/术语一致性）",
+    )
+    parser.add_argument(
+        "--speakers", type=int, default=None,
+        help="已知说话人数量（独白=1、双人对谈=2；不填则自动判断。声纹漂移大的场景建议填写）",
     )
     parser.add_argument("--duration-sec", type=float, default=None, help="录制时长（默认直到 Ctrl+C）")
     parser.add_argument("-o", "--output-dir", default="recordings", help="转录稿与录音的保存目录")
